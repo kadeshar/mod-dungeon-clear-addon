@@ -478,13 +478,19 @@ skipBtn:SetPoint("LEFT", offBtn, "RIGHT", 11, 0)
 skipBtn:SetText("Skip")
 skipBtn:SetScript("OnClick", function() SendDcCommand("skip") end)
 
--- Pause/Resume toggle. Label + enabled state are driven by UpdateStatusUI;
--- the server-side action toggles pause/resume off the same "pause" subcommand.
+-- Pause/Resume toggle. Label + enabled state are driven by UpdateStatusUI.
+-- The click sends the label's INTENT ("pause"/"resume") rather than a bare
+-- toggle: a bare "pause" flips whatever the server's flag happens to be, so a
+-- click aimed at "Pause" landing just after an auto-pause (door, Wait at Boss)
+-- would resume the run instead. With the intent the server no-ops the
+-- already-holding case and just resyncs our label.
 pauseBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
 pauseBtn:SetSize(68, 24)
 pauseBtn:SetPoint("LEFT", skipBtn, "RIGHT", 11, 0)
 pauseBtn:SetText("Pause")
-pauseBtn:SetScript("OnClick", function() SendDcCommand("pause") end)
+pauseBtn:SetScript("OnClick", function()
+    SendDcCommand("pause", isPaused and "resume" or "pause")
+end)
 
 -- Advanced-pull control on a second row: a "Pull:" caption + a 3-segment
 -- Off / On / Dynamic picker (replaces the old full-width toggle button). Each
@@ -570,7 +576,8 @@ tinyToggle:SetScript("OnClick", function(self, button)
         SendDcCommand("on")
         if PushSettings then PushSettings() end
     else
-        SendDcCommand("pause")
+        -- Send the intent, not a bare toggle — see pauseBtn's OnClick note.
+        SendDcCommand("pause", isPaused and "resume" or "pause")
     end
 end)
 tinyToggle:SetScript("OnEnter", function(self)
@@ -1505,6 +1512,8 @@ local SettingMeta = {
                              desc = "A DPS or tank mana user below this stops the party for a full rest. 0 disables." },
     SmartRestHealerManaPct = { label = "Smart Rest: Healer Mana Trigger %",
                              desc = "A healer below this mana stops the party for a full rest. 0 disables." },
+    WaitAtBoss           = { label = "Wait at Boss",
+                             desc = "Pause the run right before every boss pull and wait for you — hit Resume (or the tiny-mode dot) when your party is ready. Each boss waits once per run." },
     PullDynamicMaxLeeroyMobs = { label = "Desired maximum mobs per pull",
                              desc = "Dynamic pull only. The party's comfortable simultaneous-mob ceiling: the tank Leeroys a pack at or under this estimated aggro count, and pulls one above it back to camp." },
     PullDynamicPartyLag  = { label = "Pull: Party Lag (yd)",
@@ -1527,6 +1536,7 @@ local VisibleSettings = {
     SmartRestHealthPct       = true,
     SmartRestDpsManaPct      = true,
     SmartRestHealerManaPct   = true,
+    WaitAtBoss               = true,
     PartyMaxSpread           = true,
     PullDynamicMaxLeeroyMobs = true,
     PullDynamicPartyLag      = true,
@@ -1570,6 +1580,7 @@ local DefaultSchema = {
     SmartRestHealthPct       = { type = DCT_UINT,  min = 0,  max = 100, default = 50 },
     SmartRestDpsManaPct      = { type = DCT_UINT,  min = 0,  max = 100, default = 10 },
     SmartRestHealerManaPct   = { type = DCT_UINT,  min = 0,  max = 100, default = 40 },
+    WaitAtBoss               = { type = DCT_BOOL,  min = 0,  max = 1,  default = 0 },
     PartyMaxSpread           = { type = DCT_FLOAT, min = 10, max = 60, default = 25 },
     PullDynamicMaxLeeroyMobs = { type = DCT_UINT,  min = 1,  max = 20, default = 5 },
     PullDynamicPartyLag      = { type = DCT_FLOAT, min = 6,  max = 40, default = 15 },
@@ -1578,6 +1589,7 @@ local DefaultSchemaOrder = {
     "PreventBotRelease", "IgnoreChests", "CombatRegroup",
     "LootMinQuality", "RestHealthPct", "RestManaPct",
     "SmartRest", "SmartRestHealthPct", "SmartRestDpsManaPct", "SmartRestHealerManaPct",
+    "WaitAtBoss",
     "PartyMaxSpread", "PullDynamicMaxLeeroyMobs", "PullDynamicPartyLag",
 }
 
