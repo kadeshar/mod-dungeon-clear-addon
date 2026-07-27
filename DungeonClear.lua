@@ -43,6 +43,7 @@ end
 local UpdateFrameHeight, UpdateLayout
 local pauseBtn
 local spectateBtn
+local spectatePrevBtn, spectateNextBtn  -- seat cycling (< / >) on the same row
 local spectateAvailable        -- server allows the spectator camera? (SPECTATE msg)
 local ApplySpectateAvailability -- enable/disable the Spectate button to match
 local pullLabel          -- "Pull:" caption left of the segmented control
@@ -564,10 +565,12 @@ end)
 spectateAvailable = true
 ApplySpectateAvailability = function()
     if not spectateBtn then return end
-    if spectateAvailable then
-        spectateBtn:Enable()
-    else
-        spectateBtn:Disable()
+    -- The cycle buttons are the same feature; grey them out with it, or they
+    -- would click into the same refusal the Spectate button is greyed to avoid.
+    for _, b in ipairs({ spectateBtn, spectatePrevBtn, spectateNextBtn }) do
+        if b then
+            if spectateAvailable then b:Enable() else b:Disable() end
+        end
     end
 end
 
@@ -587,6 +590,39 @@ spectateBtn:SetScript("OnEnter", function(self)
     GameTooltip:Show()
 end)
 spectateBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+-- Seat cycling, on the same row as Spectate. The camera can sit on ANY bot in
+-- the instance, not just the tank — watch the healer through a wipe, a DPS
+-- through a burn — and clicking beats typing a randomised bot name. From no
+-- camera at all these also start one (server side treats a cycle from cold as
+-- "take the default seat"), so this row is a complete spectator control.
+spectatePrevBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+spectatePrevBtn:SetSize(30, 24)
+spectatePrevBtn:SetPoint("LEFT", spectateBtn, "RIGHT", 6, 0)
+spectatePrevBtn:SetText("|cffffd100<|r")
+spectatePrevBtn:SetScript("OnClick", function() SendDcCommand("spectate", "prev") end)
+spectatePrevBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Previous bot", 1, 1, 1)
+    GameTooltip:AddLine("Move the camera to the previous bot in the instance.",
+        0.8, 0.8, 0.8, true)
+    GameTooltip:Show()
+end)
+spectatePrevBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+spectateNextBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+spectateNextBtn:SetSize(30, 24)
+spectateNextBtn:SetPoint("LEFT", spectatePrevBtn, "RIGHT", 4, 0)
+spectateNextBtn:SetText("|cffffd100>|r")
+spectateNextBtn:SetScript("OnClick", function() SendDcCommand("spectate", "next") end)
+spectateNextBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Next bot", 1, 1, 1)
+    GameTooltip:AddLine("Move the camera to the next bot in the instance. " ..
+        "Starts the follow cam if it isn't running.", 0.8, 0.8, 0.8, true)
+    GameTooltip:Show()
+end)
+spectateNextBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
 -- Invisible click target over the tiny circle. Off -> start DC; running ->
 -- toggle pause/resume. Only shown in tiny mode (see UpdateLayout). Sits over
@@ -1091,6 +1127,8 @@ UpdateLayout = function()
         if pullLabel then pullLabel:Hide() end
         for i = 0, 2 do if pullSegs[i] then pullSegs[i]:Hide() end end
         if spectateBtn then spectateBtn:Hide() end
+        if spectatePrevBtn then spectatePrevBtn:Hide() end
+        if spectateNextBtn then spectateNextBtn:Hide() end
         listLabel:Hide()
         toggleBossesBtn:Hide()
         scrollContainer:Hide()
@@ -1121,6 +1159,8 @@ UpdateLayout = function()
         if pullLabel then pullLabel:Show() end
         for i = 0, 2 do if pullSegs[i] then pullSegs[i]:Show() end end
         if spectateBtn then spectateBtn:Show() end
+        if spectatePrevBtn then spectatePrevBtn:Show() end
+        if spectateNextBtn then spectateNextBtn:Show() end
         listLabel:Show()
         toggleBossesBtn:Show()
         statusFrame:Show()
@@ -1490,6 +1530,10 @@ optCmdList:SetText(
     "|cffffd100Spectate|r  \226\128\148  Left-click detaches you into a free-flying camera while your " ..
     "character keeps running under bot AI. Right-click instead rides the tank (follow cam), handing off " ..
     "if it dies. Click again (or |cffffd100.dc spectate|r) to return to your body.\n" ..
+    "|cffffd100< >|r (next to Spectate)  \226\128\148  Move the camera to any other bot in the instance, " ..
+    "tank or not \226\128\148 healer during a wipe, DPS during a burn. Also starts the follow cam if it " ..
+    "isn't running. |cffffd100.dc spectate next/prev/list|r, or " ..
+    "|cffffd100.dc spectate follow <name>|r to jump straight to one.\n" ..
     "|cffffd100Go|r (per boss row)  \226\128\148  Send the tank straight to that boss (turns the clear on first).\n" ..
     "|cffffd100Tiny|r  \226\128\148  Collapse the window to a single-line, movable readout.\n" ..
     "|cffffd100Settings|r (sub-page)  \226\128\148  Override the server defaults (loot quality, rest %, " ..
