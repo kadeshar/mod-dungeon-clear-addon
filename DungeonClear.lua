@@ -431,25 +431,38 @@ end
 -- Command sender via addon messages (silent, no audio cue)
 -- Uses PARTY distribution with LANG_ADDON prefix; the server-side hook
 -- intercepts and dispatches before any chat processing occurs.
+--
+-- Solo transport: a player with no group has no PARTY or RAID channel, so this
+-- used to refuse outright — which is what stopped a GM from watching a test run
+-- from OUTSIDE the bot party. Spectate is session plumbing and never needed a
+-- group; the group requirement lived only here, in the transport. A whisper to
+-- oneself is the standard addon channel with no group, and the server hook
+-- accepts it (IsDcAddonCommand). Bot commands sent this way still need a tank
+-- bot in the sender's group and are refused server-side with that reason, which
+-- is a truer error than a client-side guess.
 local function SendDcCommand(subCmd, param, silent)
     local inRaid = GetNumRaidMembers() and GetNumRaidMembers() > 0
     local inParty = GetNumPartyMembers() and GetNumPartyMembers() > 0
+
+    local payload = "CMD\t" .. subCmd
+    if param and param ~= "" then
+        payload = payload .. "\t" .. tostring(param)
+    end
+
     if inRaid or inParty then
-        local payload = "CMD\t" .. subCmd
-        if param and param ~= "" then
-            payload = payload .. "\t" .. tostring(param)
-        end
         -- In a raid, addon messages on the PARTY channel only reach the sender's
         -- own subgroup, so a tank bot in another subgroup never gets the command.
         -- Send on RAID when in a raid so it reaches every subgroup; PARTY covers
         -- the ordinary 5-man case. The server hook accepts both.
         SendAddonMessage("DC", payload, inRaid and "RAID" or "PARTY")
+        return
+    end
+
+    local me = UnitName("player")
+    if me and me ~= "" then
+        SendAddonMessage("DC", payload, "WHISPER", me)
     elseif not silent and param ~= "addon" then
-        -- Explicit user action (button / boss-list click) with no party to
-        -- relay it to: tell them once. The automatic background refreshes
-        -- (status / boss-list, param == "addon") stay silent so a solo player
-        -- standing in a dungeon isn't spammed every couple seconds.
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff3333DungeonClear: You must be in a party to send bot commands.|r")
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff3333DungeonClear: cannot send bot commands right now.|r")
     end
 end
 
@@ -531,7 +544,18 @@ spectateBtn:SetSize(100, 24)
 -- the label); start this row at -40 to keep the 8px row gap.
 spectateBtn:SetPoint("TOPLEFT", onBtn, "BOTTOMLEFT", 0, -40)
 spectateBtn:SetText("Spectate")
-spectateBtn:SetScript("OnClick", function() SendDcCommand("spectate") end)
+-- Left-click = the free-flying camera. Right-click (or shift-click) = follow
+-- cam: the view rides the run's tank instead of flying free, which is what you
+-- want when watching rather than exploring. Both are the same server toggle
+-- family, so a second click of either ends the camera.
+spectateBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+spectateBtn:SetScript("OnClick", function(self, button)
+    if button == "RightButton" or IsShiftKeyDown() then
+        SendDcCommand("spectate", "follow")
+    else
+        SendDcCommand("spectate")
+    end
+end)
 
 -- Grey out and disable the Spectate button when the server has the feature
 -- switched off, so the player can't click into a refusal. A disabled
@@ -548,10 +572,17 @@ ApplySpectateAvailability = function()
 end
 
 spectateBtn:SetScript("OnEnter", function(self)
-    if spectateAvailable then return end
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Spectator mode disabled", 1, 1, 1)
-    GameTooltip:AddLine("This server has turned off the spectator camera.",
+    if not spectateAvailable then
+        GameTooltip:SetText("Spectator mode disabled", 1, 1, 1)
+        GameTooltip:AddLine("This server has turned off the spectator camera.",
+            0.8, 0.8, 0.8, true)
+        GameTooltip:Show()
+        return
+    end
+    GameTooltip:SetText("Spectate", 1, 1, 1)
+    GameTooltip:AddLine("Left-click: free-flying camera.", 0.8, 0.8, 0.8, true)
+    GameTooltip:AddLine("Right-click: follow cam \226\128\148 your view rides the tank.",
         0.8, 0.8, 0.8, true)
     GameTooltip:Show()
 end)
@@ -1456,8 +1487,9 @@ optCmdList:SetText(
     "pack (charges in) but uses the careful |cff4db3ffAdvanced|r pull when packs are bunched in a room. The live " ..
     "choice shows on the Dyn control. " ..
     "|cff8c8c8cOff|r: walk up and fight in place.\n" ..
-    "|cffffd100Spectate|r  \226\128\148  Detach into a free-flying camera while your character keeps " ..
-    "running under bot AI. Click again (or |cffffd100.dc spectate|r) to return to your body.\n" ..
+    "|cffffd100Spectate|r  \226\128\148  Left-click detaches you into a free-flying camera while your " ..
+    "character keeps running under bot AI. Right-click instead rides the tank (follow cam), handing off " ..
+    "if it dies. Click again (or |cffffd100.dc spectate|r) to return to your body.\n" ..
     "|cffffd100Go|r (per boss row)  \226\128\148  Send the tank straight to that boss (turns the clear on first).\n" ..
     "|cffffd100Tiny|r  \226\128\148  Collapse the window to a single-line, movable readout.\n" ..
     "|cffffd100Settings|r (sub-page)  \226\128\148  Override the server defaults (loot quality, rest %, " ..
