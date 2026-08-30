@@ -46,6 +46,26 @@ local spectateBtn
 local spectatePrevBtn, spectateNextBtn  -- seat cycling (< / >) on the same row
 local spectateAvailable        -- server allows the spectator camera? (SPECTATE msg)
 local ApplySpectateAvailability -- enable/disable the Spectate button to match
+local spectateResetBtn         -- ends the camera and hands control back to you
+-- What the spectator camera is doing. The server never tells the addon, so this
+-- is modelled from the commands we send -- the one source that is always there.
+-- PLAYER_CONTROL_LOST/GAINED only correct it when this server happens to raise
+-- them; they cannot be relied on, because a module that hands your character to
+-- the bot AI can leave you unable to move without ever sending the client a
+-- control update.
+--
+--   false     nothing running -- the camera is on your own character
+--   "free"    free-flying camera
+--   "follow"  riding a bot
+--
+-- The distinction earns its keep in the reset: a bare `spectate` toggles the
+-- mode you are IN, so ending the follow cam takes two (the first only hands over
+-- to the free camera) while the free camera ends on one. Knowing which we are in
+-- is what makes one click enough without ever sending a toggle too many.
+local cameraState = false
+local UpdateResetBtnState      -- greys the reset button in/out with the state
+local SetCameraState           -- single place that moves cameraState
+local RefreshStatusHeight      -- re-measure the Warning row, then resize to fit
 local pullLabel          -- "Pull:" caption left of the segmented control
 local pullSegs = {}      -- [0]=Off [1]=On [2]=Dynamic segment buttons (full mode)
 local tinyPullDot        -- compact cycling pull circle (tiny mode)
@@ -97,6 +117,9 @@ frame:SetClampedToScreen(true)
 frame:SetFrameStrata("DIALOG")
 frame:SetToplevel(true)
 frame:SetScript("OnDragStart", function(self)
+    -- Read by PinTopLeft: re-anchoring the frame mid-drag breaks StartMoving's
+    -- grip on it, and a STATUS packet can land at any moment during a run.
+    self.isMoving = true
     self:StartMoving()
 end)
 -- Right-click anywhere on the tiny bar restores the full window. Guarded by
@@ -132,8 +155,14 @@ closeBtn:SetScript("OnClick", function()
 end)
 
 -- Status Info Subframe (Glassmorphism effect)
+-- Base height with the Warning row hidden. When a warning is showing the box
+-- grows by STALL_GAP plus however tall the wrapped warning actually came out
+-- (see StallRowHeight) -- it is free text from the server, so no fixed reserve
+-- can be right for every message.
+local STATUS_H = 131
+local STALL_GAP = 8
 local statusFrame = CreateFrame("Frame", nil, frame)
-statusFrame:SetSize(306, 115)
+statusFrame:SetSize(306, STATUS_H)
 statusFrame:SetPoint("TOP", frame, "TOP", 0, -35)
 statusFrame:SetBackdrop({
     bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
@@ -189,7 +218,9 @@ stateVal:SetTextColor(0.6, 0.6, 0.6)
 -- keeps the Next Boss / Warning rows from shifting.
 local detailVal = statusFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 detailVal:SetPoint("TOPLEFT", stateLabel, "BOTTOMLEFT", 0, -2)
-detailVal:SetWidth(300)
+-- 286, not 300: the row starts 10px inside a 306-wide box, so 300 ran past the
+-- right edge before the 3px border inset was even counted.
+detailVal:SetWidth(286)
 detailVal:SetJustifyH("LEFT")
 detailVal:SetTextColor(0.7, 0.7, 0.7)
 detailVal:SetText("")
@@ -207,6 +238,13 @@ targetLabel:SetTextColor(0.8, 0.8, 0.8)
 
 local targetVal = statusFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 targetVal:SetPoint("LEFT", targetLabel, "RIGHT", 5, 0)
+-- Unbounded, a long objective name ("Objective: Atal'ai Defender (Mijan)") ran
+-- straight out through the box and the window edge. Clamp it to the space left
+-- beside the caption and truncate rather than wrap -- wrapping around a LEFT
+-- anchor would grow upward into the detail line above.
+targetVal:SetWidth(210)
+targetVal:SetJustifyH("LEFT")
+targetVal:SetWordWrap(false)
 targetVal:SetText("None")
 targetVal:SetTextColor(1, 1, 1)
 
@@ -217,11 +255,64 @@ stallLabel:SetTextColor(0.9, 0.2, 0.2)
 stallLabel:Hide()
 
 local stallVal = statusFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-stallVal:SetPoint("LEFT", stallLabel, "RIGHT", 5, 0)
+-- TOPLEFT, not LEFT: warning text is server-authored and regularly wraps, and a
+-- LEFT anchor centers the wrapped block on the caption, so the second line grew
+-- *upward* into the Next Boss row. Anchored at the top it grows downward, and
+-- the box grows with it. (Same fix as stateVal above.)
+stallVal:SetPoint("TOPLEFT", stallLabel, "TOPRIGHT", 5, 0)
 stallVal:SetTextColor(0.9, 0.4, 0.4)
-stallVal:SetWidth(210)
+stallVal:SetWidth(226)
 stallVal:SetJustifyH("LEFT")
 stallVal:Hide()
+
+-- Warning row height, MEASURED rather than reserved. The warning is free text
+-- from the server of any length, so the two lines the box used to reserve for it
+-- (the old flat SetHeight(151)) were a guess: anything that wrapped to a third
+-- line ran straight out of the box and over the action buttons below. Ask the
+-- engine how tall the wrapped block actually came out and let the status box --
+-- and with it the window, whose height is summed from this one in
+-- UpdateFrameHeight -- follow along.
+-- GetStringHeight and GetHeight disagree depending on how far the engine has got
+-- with the layout, so take whichever is larger, with one caption line as the
+-- floor so a one-word warning still gets a full row.
+local function StallRowHeight()
+    local h = 14
+    local lh = stallLabel:GetHeight()
+    if lh and lh > h then h = lh end
+    local sh = stallVal:GetStringHeight()
+    if sh and sh > h then h = sh end
+    local rh = stallVal:GetHeight()
+    if rh and rh > h then h = rh end
+    return h
+end
+
+local function ApplyStatusHeight()
+    if stallVal:IsShown() then
+        statusFrame:SetHeight(STATUS_H + STALL_GAP + StallRowHeight())
+    else
+        statusFrame:SetHeight(STATUS_H)
+    end
+    if UpdateFrameHeight then UpdateFrameHeight() end
+end
+
+-- The engine only finishes laying wrapped text out on the frame AFTER SetText,
+-- so the measurement taken the instant a new warning arrives can still describe
+-- the previous one. Re-measure over the next few frames and then stop; a hidden
+-- frame gets no OnUpdate, which is what Hide() is doing here as the off switch.
+local stallTicker = CreateFrame("Frame")
+stallTicker:Hide()
+local stallTicks = 0
+stallTicker:SetScript("OnUpdate", function(self)
+    stallTicks = stallTicks + 1
+    ApplyStatusHeight()
+    if stallTicks >= 3 then self:Hide() end
+end)
+
+RefreshStatusHeight = function()
+    ApplyStatusHeight()
+    stallTicks = 0
+    stallTicker:Show()
+end
 
 -- Tiny (single-line) display: on/off circle + status + targeted boss
 local tinyIndicator = frame:CreateTexture(nil, "OVERLAY")
@@ -289,7 +380,7 @@ local function UpdateStatusUI(enabled, targetName, state, stallReason, detail, p
         targetVal:SetTextColor(0.6, 0.6, 0.6)
         stallLabel:Hide()
         stallVal:Hide()
-        statusFrame:SetHeight(131)
+        RefreshStatusHeight()
     else
         isDCOn = true
         if isPaused then
@@ -363,12 +454,13 @@ local function UpdateStatusUI(enabled, targetName, state, stallReason, detail, p
             stallLabel:Show()
             stallVal:Show()
             stallVal:SetText(stallReason)
-            statusFrame:SetHeight(151)
         else
             stallLabel:Hide()
             stallVal:Hide()
-            statusFrame:SetHeight(131)
         end
+        -- Measured, not reserved. SetText above only QUEUES the layout, so this
+        -- re-measures over the next few frames as well as right now.
+        RefreshStatusHeight()
     end
 
     -- Update the tiny single-line display: circle + status + boss
@@ -553,8 +645,17 @@ spectateBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 spectateBtn:SetScript("OnClick", function(self, button)
     if button == "RightButton" or IsShiftKeyDown() then
         SendDcCommand("spectate", "follow")
+        SetCameraState("follow")
     else
+        -- A bare toggle means different things from different seats: from no
+        -- camera it starts the free one, from the follow cam it hands over TO
+        -- the free one, and only from the free camera does it actually end.
         SendDcCommand("spectate")
+        if cameraState == "free" then
+            SetCameraState(false)
+        else
+            SetCameraState("free")
+        end
     end
 end)
 
@@ -572,6 +673,9 @@ ApplySpectateAvailability = function()
             if spectateAvailable then b:Enable() else b:Disable() end
         end
     end
+    -- The reset has a second condition (is a camera even running?), so it goes
+    -- through its own rule rather than being flipped with the rest of the row.
+    if UpdateResetBtnState then UpdateResetBtnState() end
 end
 
 spectateBtn:SetScript("OnEnter", function(self)
@@ -600,7 +704,10 @@ spectatePrevBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
 spectatePrevBtn:SetSize(30, 24)
 spectatePrevBtn:SetPoint("LEFT", spectateBtn, "RIGHT", 6, 0)
 spectatePrevBtn:SetText("|cffffd100<|r")
-spectatePrevBtn:SetScript("OnClick", function() SendDcCommand("spectate", "prev") end)
+spectatePrevBtn:SetScript("OnClick", function()
+    SendDcCommand("spectate", "prev")
+    SetCameraState("follow")  -- cycling from cold starts a follow cam too
+end)
 spectatePrevBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:SetText("Previous bot", 1, 1, 1)
@@ -614,7 +721,10 @@ spectateNextBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
 spectateNextBtn:SetSize(30, 24)
 spectateNextBtn:SetPoint("LEFT", spectatePrevBtn, "RIGHT", 4, 0)
 spectateNextBtn:SetText("|cffffd100>|r")
-spectateNextBtn:SetScript("OnClick", function() SendDcCommand("spectate", "next") end)
+spectateNextBtn:SetScript("OnClick", function()
+    SendDcCommand("spectate", "next")
+    SetCameraState("follow")
+end)
 spectateNextBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:SetText("Next bot", 1, 1, 1)
@@ -623,6 +733,75 @@ spectateNextBtn:SetScript("OnEnter", function(self)
     GameTooltip:Show()
 end)
 spectateNextBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+-- Way back: ends whatever camera is running and returns you to your own body.
+-- It gets its own button because the exit was not discoverable -- nothing on
+-- this row said how to get out, and while the camera rides a bot your character
+-- does not answer to the keyboard, so being stuck there is the worst state the
+-- panel can leave you in. Flush right on the spectate row, set apart from the
+-- < > pair by a wider gap so it reads as the exit rather than a third seat
+-- control.
+spectateResetBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+spectateResetBtn:SetSize(110, 24)
+spectateResetBtn:SetPoint("TOPRIGHT", pauseBtn, "BOTTOMRIGHT", 0, -40)
+spectateResetBtn:SetText("Reset Camera")
+
+-- Greyed out whenever no camera is running, so the button can only ever end one.
+UpdateResetBtnState = function()
+    if not spectateResetBtn then return end
+    if spectateAvailable ~= false and cameraState ~= false then
+        spectateResetBtn:Enable()
+    else
+        spectateResetBtn:Disable()
+    end
+end
+
+SetCameraState = function(state)
+    cameraState = state
+    UpdateResetBtnState()
+end
+
+-- Apply the starting state now, or the button would sit there looking clickable
+-- until something first moved the camera.
+UpdateResetBtnState()
+
+-- Ending the follow cam takes two toggles, and they cannot go out back to back:
+-- the first has to reach the server and hand the camera over before the second
+-- means anything. So the reset sends one now and queues this one a second later.
+local secondToggle = CreateFrame("Frame")
+local secondElapsed = 0
+secondToggle:Hide()
+secondToggle:SetScript("OnUpdate", function(self, elap)
+    secondElapsed = secondElapsed + elap
+    if secondElapsed < 1.0 then return end
+    self:Hide()
+    SendDcCommand("spectate")
+end)
+
+spectateResetBtn:SetScript("OnClick", function()
+    -- The whole contract of this button: it always leaves the camera on your own
+    -- character, and never takes it away. With nothing running there is nothing
+    -- to end, and a toggle here would START a camera -- so it does nothing at
+    -- all. Same rule the greying-out uses, belt and braces.
+    if cameraState == false then return end
+
+    -- Only the follow cam needs the follow-up; from the free camera a second
+    -- toggle would switch a fresh camera back on.
+    local needsSecond = (cameraState == "follow")
+    SetCameraState(false)
+    SendDcCommand("spectate")
+    secondElapsed = 0
+    if needsSecond then secondToggle:Show() end
+end)
+
+spectateResetBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Reset Camera", 1, 1, 1)
+    GameTooltip:AddLine("Ends the spectator camera and hands control of your " ..
+        "own character back to you.", 0.8, 0.8, 0.8, true)
+    GameTooltip:Show()
+end)
+spectateResetBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
 -- Invisible click target over the tiny circle. Off -> start DC; running ->
 -- toggle pause/resume. Only shown in tiny mode (see UpdateLayout). Sits over
@@ -838,6 +1017,14 @@ scrollContainer:SetBackdropBorderColor(0.15, 0.17, 0.22, 0.8)
 local ROW_HEIGHT = 48
 local VISIBLE_ROWS = 4
 
+-- Row width, chosen per redraw by FitRows. The scroll frame reserves 28px on its
+-- right for the scrollbar whether or not one is showing, and the rows were a
+-- flat 262 to stay clear of it -- so with four or fewer bosses (the common case)
+-- that strip sat empty for good and every row was needlessly narrow. 290 fills
+-- it, leaving the same 8px margin on the right that the list has on the left.
+local ROW_W = 290
+local ROW_W_SCROLLBAR = 262
+
 -- Scrollable boss list. FauxScrollFrame is the idiomatic WotLK pattern: a small
 -- fixed pool of visible rows is reused while an offset selects which slice of
 -- `bosses` they display, so the list scrolls without growing the window.
@@ -856,7 +1043,7 @@ end)
 -- Pre-create the visible row pool inside scrollContainer, anchored to scrollFrame
 for i = 1, VISIBLE_ROWS do
     local row = CreateFrame("Frame", nil, scrollContainer)
-    row:SetSize(262, ROW_HEIGHT - 2)
+    row:SetSize(ROW_W, ROW_HEIGHT - 2)
     row:SetPoint("TOPLEFT", scrollFrame, "TOPLEFT", 0, -(i - 1) * ROW_HEIGHT)
 
     -- Custom solid color texture instead of SetBackdrop to prevent client crashes
@@ -924,6 +1111,17 @@ for i = 1, VISIBLE_ROWS do
     bossRows[i] = row
 end
 
+-- Give the rows back the scrollbar's strip whenever no scrollbar is showing.
+-- FauxScrollFrame shows one exactly when there are more bosses than visible
+-- rows, which is the same test it makes itself in FauxScrollFrame_Update.
+local function FitRows(numItems)
+    local w = ROW_W
+    if numItems > VISIBLE_ROWS then w = ROW_W_SCROLLBAR end
+    for i = 1, VISIBLE_ROWS do
+        bossRows[i]:SetWidth(w)
+    end
+end
+
 -- Colour a folded-event sub-line by each event's completion state. The server
 -- (DungeonClearChatActions) appends " (done)" / " (skipped)" to finished events
 -- and leaves pending ones bare; several events gating one boss arrive joined by
@@ -956,6 +1154,7 @@ RedrawBossList = function()
     -- The OnUpdate ensure-loop keeps re-requesting until bosses populate.
     if #bosses == 0 then
         FauxScrollFrame_Update(scrollFrame, 0, VISIBLE_ROWS, ROW_HEIGHT)
+        FitRows(0)
         for i = 1, VISIBLE_ROWS do bossRows[i]:Hide() end
         local row = bossRows[1]
         row.eventNoteFull = nil
@@ -971,6 +1170,7 @@ RedrawBossList = function()
     end
 
     FauxScrollFrame_Update(scrollFrame, #bosses, VISIBLE_ROWS, ROW_HEIGHT)
+    FitRows(#bosses)
     local offset = FauxScrollFrame_GetOffset(scrollFrame)
 
     for i = 1, VISIBLE_ROWS do
@@ -1096,21 +1296,71 @@ if btnText then
     btnText:SetTextColor(0.24, 0.60, 1.0)
 end
 
+-- Keep the window's top-left corner fixed across height changes. The frame is
+-- anchored by CENTER out of the box (and StopMovingOrSizing can leave any anchor
+-- behind), so every height change -- a Warning row appearing mid-run, folding the
+-- boss list, switching to tiny -- moved the whole window by half the delta and
+-- dropped the header somewhere new. Re-pinning to the current top-left first
+-- makes the window grow and shrink downward only.
+local function PinTopLeft()
+    -- Re-anchoring mid-drag breaks StartMoving's grip on the frame, and STATUS
+    -- packets (which land continuously during a run) can fire this at any time.
+    if frame.isMoving then return end
+    local left, top = frame:GetLeft(), frame:GetTop()
+    if not left or not top then return end  -- no valid rect yet (load time)
+    frame:ClearAllPoints()
+    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+    -- Persist in the same form, so a reload restores the window exactly where it
+    -- sits now instead of re-centring it on whatever height it had.
+    DungeonClearDB.point = "TOPLEFT"
+    DungeonClearDB.relativePoint = "BOTTOMLEFT"
+    DungeonClearDB.xOfs = left
+    DungeonClearDB.yOfs = top
+end
+
+-- Height changes go through here so the pin happens exactly once per real
+-- change, not on every status refresh that recomputes the same number.
+local function SetFrameHeight(h)
+    if math.abs(frame:GetHeight() - h) < 0.5 then return end
+    PinTopLeft()
+    frame:SetHeight(h)
+end
+
+-- The stack hanging off the action row's bottom, read from the anchors that
+-- actually place it rather than baked into the height constants:
+--   76   onBtn bottom -> boss-list caption top (the pull row + the spectate row)
+--   +    the caption's own height
+--   4    caption -> list container, then the 205px container itself
+local LIST_GAP, LIST_PAD, LIST_H, TOGGLE_H = 76, 4, 205, 24
+
+local function BelowActionRow()
+    local capH = listLabel:GetHeight()
+    if not capH or capH < 1 then capH = 14 end  -- not laid out yet (load time)
+    if DungeonClearDB.bossesFolded then
+        -- Caption row only. The [+]/[-] button is taller than the caption and
+        -- vertically centred on it, so IT sets the lower edge, not the text.
+        return LIST_GAP + math.max(capH, capH / 2 + TOGGLE_H / 2)
+    end
+    return LIST_GAP + capH + LIST_PAD + LIST_H
+end
+
 UpdateFrameHeight = function()
-    local hasStall = stallVal:IsShown()
     if DungeonClearDB.tinyMode then
-        frame:SetHeight(28)
+        SetFrameHeight(28)
         UpdateTinyWidth()
     else
         frame:SetWidth(330)
-        -- +32 each for the advanced-pull and spectate rows (24px button + 8px gap).
-        -- The base figures include the +10 reserve added to statusFrame so a
-        -- two-line detail sub-line clears the Next Boss row (see targetLabel).
-        if DungeonClearDB.bossesFolded then
-            frame:SetHeight(hasStall and 330 or 310)
-        else
-            frame:SetHeight(hasStall and 560 or 540)
-        end
+        -- Summed from the real stack instead of the four hardcoded figures this
+        -- replaces, which had gone stale: 540 left a 31px dead strip below the
+        -- boss list, and the warning variants only added the flat 20px the
+        -- status box used to grow by, which a three-line warning overran.
+        --   35  window top -> status box
+        --   +   the box's live height, already grown by however many lines the
+        --       Warning actually wrapped to (ApplyStatusHeight measured it)
+        --   8   gap, then the 24px action row
+        --   +   the stack below it (BelowActionRow)
+        --   12  bottom padding
+        SetFrameHeight(35 + statusFrame:GetHeight() + 8 + 24 + BelowActionRow() + 12)
     end
 end
 
@@ -1129,6 +1379,7 @@ UpdateLayout = function()
         if spectateBtn then spectateBtn:Hide() end
         if spectatePrevBtn then spectatePrevBtn:Hide() end
         if spectateNextBtn then spectateNextBtn:Hide() end
+        if spectateResetBtn then spectateResetBtn:Hide() end
         listLabel:Hide()
         toggleBossesBtn:Hide()
         scrollContainer:Hide()
@@ -1161,6 +1412,7 @@ UpdateLayout = function()
         if spectateBtn then spectateBtn:Show() end
         if spectatePrevBtn then spectatePrevBtn:Show() end
         if spectateNextBtn then spectateNextBtn:Show() end
+        if spectateResetBtn then spectateResetBtn:Show() end
         listLabel:Show()
         toggleBossesBtn:Show()
         statusFrame:Show()
@@ -1194,6 +1446,7 @@ end)
 
 -- Layout saving on drag stop
 frame:SetScript("OnDragStop", function(self)
+    self.isMoving = nil
     self:StopMovingOrSizing()
     local point, _, relativePoint, xOfs, yOfs = self:GetPoint()
     DungeonClearDB.point = point
@@ -1211,6 +1464,13 @@ eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+-- Corrective only, for the camera state the addon models from its own commands:
+-- the spectator camera takes control of our character away and hands it back, so
+-- these let the "Reset Camera" button tell a camera that is still running from
+-- one that has already been released (a typed `.dc spectate`, or the server
+-- dropping it on its own). Not every server raises them -- see cameraState.
+eventFrame:RegisterEvent("PLAYER_CONTROL_LOST")
+eventFrame:RegisterEvent("PLAYER_CONTROL_GAINED")
 
 -- Request the boss list from the tank bot. The server's "dungeon bosses" value
 -- returns empty (and caches that for ~5s) whenever the bot isn't fully in the
@@ -1459,6 +1719,16 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         if frame:IsVisible() and isDCOn then
             SendDcCommand("status", "addon")
         end
+    elseif event == "PLAYER_CONTROL_LOST" then
+        -- Corrective only: catches a camera started outside this panel (a typed
+        -- `.dc spectate`). If we already track a mode, that one is more precise
+        -- than the guess this could make, so it is left alone.
+        if not cameraState then SetCameraState("free") end
+    elseif event == "PLAYER_CONTROL_GAINED" then
+        -- The camera let go for real. Cancel a queued second toggle -- it was
+        -- meant to finish the job, and now it would only start a new camera.
+        secondToggle:Hide()
+        SetCameraState(false)
     end
 end)
 
